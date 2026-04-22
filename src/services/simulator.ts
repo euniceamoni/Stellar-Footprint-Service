@@ -7,9 +7,131 @@ import {
 } from "./footprintParser";
 import { optimizeFootprint } from "./optimizer";
 
-export interface TtlInfo {
-  liveUntilLedger: number;
-  expiresInLedgers: number;
+// Cache for contract existence checks (contractIdString -> { exists: boolean, timestamp: number })
+const contractExistenceCache = new Map<
+  string,
+  { exists: boolean; timestamp: number }
+>();
+const CONTRACT_EXISTENCE_CACHE_TTL = 30 * 1000; // 30 seconds
+
+/**
+ * Check if a contract exists on the network by looking up its account ledger entry.
+ * Uses caching to avoid repeated RPC calls for the same contract within the TTL.
+ * @param server - The RPC server instance
+ * @param contractIdString - The contract ID in string format (account ID)
+ * @returns True if the contract exists, false otherwise
+ */
+async function checkContractExists(
+  server: StellarSdk.SorobanRpc.Server,
+  contractIdString: string,
+): Promise<boolean> {
+  const now = Date.now();
+  const cached = contractExistenceCache.get(contractIdString);
+  if (cached && now - cached.timestamp < CONTRACT_EXISTENCE_CACHE_TTL) {
+    return cached.exists;
+  }
+
+  try {
+    // Convert contractIdString to LedgerKey for an account
+    const accountId = StellarSdk.xdr.AccountId.fromString(contractIdString);
+    const ledgerKey = StellarSdk.xdr.LedgerKey.account(accountId);
+    const response = await server.getLedgerEntries(ledgerKey);
+    const exists = response.entries && response.entries.length > 0;
+    contractExistenceCache.set(contractIdString, { exists, timestamp: now });
+    return exists;
+  } catch (err) {
+    // If there's an error (e.g., network, invalid ID), assume contract does not exist
+    contractExistenceCache.set(contractIdString, {
+      exists: false,
+      timestamp: now,
+    });
+    return false;
+  }
+}
+
+/**
+ * Extract required signers from auth entries in a simulation response
+ * @param auth - The auth array from SorobanRpc.Api.SimulateTransactionResponse
+ * @returns Object containing requiredSigners array and threshold number
+ */
+function extractRequiredSigners(
+  auth: StellarSdk.xdr.SorobanAuthorization[] | undefined,
+): { requiredSigners: string[]; threshold: number } {
+  if (!auth || auth.length === 0) {
+    return { requiredSigners: [], threshold: 0 };
+  }
+
+  const signers: string[] = [];
+  let maxThreshold = 0;
+
+  for (const authEntry of auth) {
+    // Extract address from auth entry
+    let address: string | null = null;
+
+    // Handle different auth types
+    if (
+      StellarSdk.xdr.SorobanAuthorizationType.account() === authEntry.authType()
+    ) {
+      // Account auth - contains account address
+      const accountAuth = authEntry.account();
+      if (accountAuth) {
+        address = StellarSdk.xdr.ScAddress.toXDR(
+          accountAuth.address(),
+          "base64",
+        );
+        // Convert base64 ScAddress back to string account ID
+        try {
+          const scAddr = StellarSdk.xdr.ScAddress.fromXDR(address, "base64");
+          const accountId = scAddr.accountId();
+          address = StellarSdk.StrKey.encodeEd25519PublicKey(
+            accountId.ed25519().toRawBytes(),
+          );
+        } catch (e) {
+          // Fallback to using the address directly if conversion fails
+          address = accountAuth.address().toString();
+        }
+      }
+    } else if (
+      StellarSdk.xdr.SorobanAuthorizationType.contract() ===
+      authEntry.authType()
+    ) {
+      // Contract auth - contains contract address
+      const contractAuth = authEntry.contract();
+      if (contractAuth) {
+        address = StellarSdk.xdr.ScAddress.toXDR(
+          contractAuth.address(),
+          "base64",
+        );
+        // Convert base64 ScAddress back to string contract ID
+        try {
+          const scAddr = StellarSdk.xdr.ScAddress.fromXDR(address, "base64");
+          // For contract addresses, we'll keep them as is for now
+          address = scAddr.toString();
+        } catch (e) {
+          // Fallback to using the address directly if conversion fails
+          address = contractAuth.address().toString();
+        }
+      }
+    }
+
+    if (address) {
+      signers.push(address);
+    }
+
+    // Track the highest threshold encountered
+    const threshold = authEntry.auth().threshold() ?? 0;
+    if (threshold > maxThreshold) {
+      maxThreshold = threshold;
+    }
+  }
+
+  // Remove duplicates while preserving order
+  const uniqueSigners = [...new Set(signers)];
+
+  return {
+    requiredSigners: uniqueSigners,
+    threshold: maxThreshold,
+  };
 }
 
 export interface SimulateResult {
@@ -34,6 +156,12 @@ export interface SimulateResult {
     memBytes: string;
   };
   error?: string;
+  /** Contract ID that was not found (if error is "Contract not found") */
+  contractId?: string;
+  /** Required signers for multi-signature transactions */
+  requiredSigners?: string[];
+  /** Threshold for multi-signature transactions */
+  threshold?: number;
   raw?: StellarSdk.SorobanRpc.Api.SimulateTransactionResponse;
 }
 
@@ -135,6 +263,10 @@ export async function simulateTransaction(
   // Fetch TTL information
   const ttl = await fetchTtlInfo(server, allXdrEntries);
 
+  // Extract required signers from auth entries
+  const auth = response.transactionData?.build().auth() ?? [];
+  const { requiredSigners, threshold } = extractRequiredSigners(auth);
+
   return {
     success: true,
     footprint: {
@@ -149,6 +281,8 @@ export async function simulateTransaction(
       cpuInsns: response.cost?.cpuInsns ?? "0",
       memBytes: response.cost?.memBytes ?? "0",
     },
+    requiredSigners,
+    threshold,
     raw: response,
   };
 }
