@@ -8,7 +8,7 @@ import {
   type ContractType,
 } from "./footprintParser";
 import { optimizeFootprint } from "./optimizer";
-import { calculateResourceFee } from "./feeEstimator";
+
 
 // Cache for contract existence checks (contractIdString -> { exists: boolean, timestamp: number })
 const contractExistenceCache = new Map<
@@ -57,6 +57,21 @@ export interface TtlInfo {
   expiresInLedgers: number;
 }
 
+/**
+ * Result of a transaction simulation
+ * @property success - Whether the simulation succeeded
+ * @property footprint - Extracted read-only and read-write ledger entries
+ * @property contracts - All unique contract IDs touched by the transaction
+ * @property contractType - SEP-41 token contract detection result
+ * @property ttl - TTL information keyed by XDR hash
+ * @property optimized - Whether footprint was optimized
+ * @property rawFootprint - Original footprint before optimization
+ * @property cost - Resource costs (CPU instructions and memory bytes)
+ * @property resourceFee - Resource fee calculated from simulation cost
+ * @property error - Error message if simulation failed
+ * @property contractId - Contract ID that was not found (if applicable)
+ * @property raw - Raw RPC response
+ */
 export interface SimulateResult {
   success: boolean;
   footprint?: {
@@ -138,6 +153,14 @@ async function fetchTtlInfo(
   }
 }
 
+/**
+ * Simulate a Soroban transaction and extract its footprint
+ * @param xdr - Base64-encoded transaction XDR
+ * @param network - The network to simulate against ("testnet" or "mainnet")
+ * @param signal - Optional AbortSignal for request cancellation
+ * @param ledgerSequence - Optional specific ledger sequence to simulate against
+ * @returns Simulation result with footprint, contracts, costs, and TTL info
+ */
 export async function simulateTransaction(
   xdr: string,
   network: Network = "testnet",
@@ -169,7 +192,8 @@ export async function simulateTransaction(
   if (!response.transactionData) {
     return {
       success: false,
-      error: "Simulation succeeded but transactionData is missing; cannot extract footprint.",
+      error:
+        "Simulation succeeded but transactionData is missing; cannot extract footprint.",
       raw: response,
     };
   }
@@ -199,10 +223,6 @@ export async function simulateTransaction(
   // Fetch TTL information
   const ttl = await fetchTtlInfo(server, allXdrEntries);
 
-  // Extract required signers from auth entries
-  const auth = response.transactionData?.build().auth() ?? [];
-  const { requiredSigners, threshold } = extractRequiredSigners(auth);
-
   // Detect SEP-41 token contract type for the first invoked contract
   const contractType =
     contracts.length > 0
@@ -224,8 +244,6 @@ export async function simulateTransaction(
       cpuInsns: response.cost?.cpuInsns ?? "0",
       memBytes: response.cost?.memBytes ?? "0",
     },
-    requiredSigners,
-    threshold,
     raw: response,
   };
 }
