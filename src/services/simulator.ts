@@ -6,6 +6,7 @@ import {
   type FootprintEntry,
 } from "./footprintParser";
 import { optimizeFootprint } from "./optimizer";
+import { calculateResourceFee } from "./feeEstimator";
 
 // Cache for contract existence checks (contractIdString -> { exists: boolean, timestamp: number })
 const contractExistenceCache = new Map<
@@ -75,6 +76,8 @@ export interface SimulateResult {
     cpuInsns: string;
     memBytes: string;
   };
+  /** Resource fee calculated from simulation cost and network fee parameters */
+  resourceFee?: string;
   error?: string;
   /** Contract ID that was not found (if error is "Contract not found") */
   contractId?: string;
