@@ -51,6 +51,20 @@ export async function simulate(req: Request, res: Response): Promise<void> {
       res.status(422).json(result);
     }
   } catch (err: unknown) {
+    // Handle circuit breaker open state
+    if (
+      err instanceof Error &&
+      (err as { circuitOpen?: boolean; retryAfter?: number }).circuitOpen
+    ) {
+      const retryAfter =
+        (err as unknown as { retryAfter: number }).retryAfter ?? 30;
+      res
+        .status(503)
+        .set("Retry-After", String(retryAfter))
+        .json({ error: "Service temporarily unavailable", retryAfter });
+      return;
+    }
+
     const message = err instanceof Error ? err.message : "Unexpected error";
 
     // Record failed simulation
